@@ -64,12 +64,60 @@ def normalize_create(payload):
         "station_id": station_id,
         "region": region,
         "strength_dbm": strength,
+        "original_strength_dbm": strength,
         "detected_at": detected_at,
         "reporter": reporter,
         "measurement_revisions": [],
         "suspend_authorization": None,
         "_stable_key": stable_key,
     }
+
+
+MAX_OFFLINE_BATCH = 200
+
+
+def normalize_offline_measurement(payload):
+    if not isinstance(payload, dict):
+        raise DomainError("invalid_measurement", "测量记录必须是对象")
+    item_id = payload.get("item_id")
+    if isinstance(item_id, bool):
+        raise DomainError("invalid_number", "item_id 必须是整数")
+    try:
+        item_id = int(item_id)
+    except (TypeError, ValueError):
+        raise DomainError("invalid_number", "item_id 必须是整数")
+    measurement_id = payload.get("measurement_id")
+    if measurement_id is not None:
+        measurement_id = str(measurement_id).strip() or None
+    region = payload.get("region")
+    if region is not None:
+        region = str(region).strip() or None
+    return {
+        "item_id": item_id,
+        "strength_dbm": number(payload, "strength_dbm"),
+        "observed_at": parse_timestamp(payload, "observed_at"),
+        "measurement_id": measurement_id,
+        "region": region,
+        "station_id": payload.get("station_id"),
+        "frequency_mhz": payload.get("frequency_mhz"),
+    }
+
+
+def normalize_offline_batch(payload):
+    batch_id = payload.get("batch_id")
+    if batch_id is not None:
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise DomainError("invalid_batch", "batch_id 无效")
+        batch_id = batch_id.strip()
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, list) or not measurements:
+        raise DomainError("field_required", "measurements 不能为空")
+    if len(measurements) > MAX_OFFLINE_BATCH:
+        raise DomainError("batch_too_large", "单批次最多 %d 条测量" % MAX_OFFLINE_BATCH)
+    normalized = []
+    for raw in measurements:
+        normalized.append((normalize_offline_measurement(raw), raw))
+    return batch_id, normalized
 
 
 def normalize_source(payload):

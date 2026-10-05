@@ -59,6 +59,20 @@ class Repository:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(item_id) REFERENCES items(id)
                 );
+                CREATE TABLE IF NOT EXISTS offline_measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    vehicle_id TEXT NOT NULL,
+                    batch_id TEXT,
+                    measurement_id TEXT,
+                    dedup_key TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(dedup_key),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_offline_measurements_item ON offline_measurements(item_id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER,
@@ -198,6 +212,104 @@ class Repository:
         conn = self.connect()
         try:
             rows = conn.execute("SELECT * FROM sources WHERE item_id=? ORDER BY id DESC", (item_id,)).fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                result.append(value)
+            return result
+        finally:
+            conn.close()
+
+    def ingest_offline_batch(self, vehicle_id, batch_id, entries, actor, role, merge_fn):
+        """单事务合并一批离线测量。重复 dedup_key 跳过，整批要么入库要么回滚。
+
+        merge_fn(item, entry, archived, actor) 返回
+        (item是否变更, 新payload, 结果信息)；状态列不在此处改动，保证不回退。
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            results = []
+            for entry in entries:
+                normalized = entry["normalized"]
+                item_id = normalized["item_id"]
+                duplicate = conn.execute(
+                    "SELECT id FROM offline_measurements WHERE dedup_key=?", (entry["dedup_key"],)
+                ).fetchone()
+                if duplicate:
+                    results.append({
+                        "item_id": item_id,
+                        "measurement_id": normalized.get("measurement_id"),
+                        "status": "duplicate",
+                    })
+                    continue
+                row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("item_not_found", "业务实体不存在")
+                item = self._row_to_item(row)
+                conn.execute(
+                    "INSERT INTO offline_measurements(item_id,vehicle_id,batch_id,measurement_id,dedup_key,payload,observed_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        item_id,
+                        vehicle_id,
+                        batch_id,
+                        normalized.get("measurement_id"),
+                        entry["dedup_key"],
+                        canonical_json(entry["raw"]),
+                        normalized["observed_at"],
+                        now_iso(),
+                    ),
+                )
+                measurement_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                archived = conn.execute(
+                    "SELECT dedup_key, payload FROM offline_measurements WHERE item_id=?", (item_id,)
+                ).fetchall()
+                archived_set = [
+                    {"dedup_key": r["dedup_key"], "strength_dbm": json.loads(r["payload"]).get("strength_dbm")}
+                    for r in archived
+                ]
+                changed, new_payload, info = merge_fn(item, entry, archived_set, actor)
+                if changed:
+                    conn.execute(
+                        "UPDATE items SET version=?,payload=?,updated_at=? WHERE id=?",
+                        (int(item["version"]) + 1, canonical_json(new_payload), now_iso(), item_id),
+                    )
+                audit_payload = {
+                    "measurement_row_id": measurement_id,
+                    "measurement_id": normalized.get("measurement_id"),
+                    "batch_id": batch_id,
+                    "dedup_key": entry["dedup_key"],
+                    "applied": info["applied"],
+                    "late": info["late"],
+                    "conflict_pending": info["conflict_pending"],
+                }
+                self.append_audit(conn, item_id, "offline_measurement", actor, role, audit_payload)
+                results.append({
+                    "item_id": item_id,
+                    "measurement_id": normalized.get("measurement_id"),
+                    "status": "stored",
+                    "applied": info["applied"],
+                    "late": info["late"],
+                    "conflict_pending": info["conflict_pending"],
+                })
+            conn.execute("COMMIT")
+            return results
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_measurements(self, item_id):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM offline_measurements WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
             result = []
             for row in rows:
                 value = dict(row)

@@ -1,4 +1,7 @@
+import hashlib
+
 from . import domain, rules
+from .audit import canonical_json
 from .domain import DomainError
 
 
@@ -58,9 +61,63 @@ class Service:
     def get_item(self, item_id):
         item = self.repository.get_item(item_id)
         item["sources"] = self.repository.list_sources(item_id)
+        item["measurements"] = self.repository.list_measurements(item_id)
         item["audit"] = self.repository.audit_trail(item_id)
         item["assessment"] = rules.assess(item["payload"])
         return item
+
+    def _offline_dedup_key(self, vehicle_id, batch_id, normalized):
+        measurement_id = normalized.get("measurement_id")
+        if measurement_id and batch_id:
+            return "batch|%s|%s|%s" % (vehicle_id, batch_id, measurement_id)
+        if measurement_id:
+            return "legacy|%s|%s" % (vehicle_id, measurement_id)
+        # 旧数据无批次号也无测量号：按内容哈希兼容并入
+        digest = hashlib.sha256(canonical_json({
+            "item_id": normalized["item_id"],
+            "observed_at": normalized["observed_at"],
+            "strength_dbm": normalized["strength_dbm"],
+            "station_id": normalized.get("station_id"),
+            "frequency_mhz": normalized.get("frequency_mhz"),
+        }).encode("utf-8")).hexdigest()
+        return "legacy-content|%s|%s" % (vehicle_id, digest)
+
+    def ingest_offline_batch(self, payload, actor, role, region=None):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        if role not in rules.OFFLINE_BATCH_ROLES:
+            raise DomainError("forbidden", "当前角色不能回传离线测量", 403)
+        batch_id, pairs = domain.normalize_offline_batch(payload)
+        entries = []
+        items = {}
+        for normalized, raw in pairs:
+            item_id = normalized["item_id"]
+            if item_id not in items:
+                items[item_id] = self.repository.get_item(item_id)
+            item = items[item_id]
+            if region and rules.ENFORCE_REGION and role != "regulator":
+                if normalized.get("region") and normalized["region"] != region:
+                    raise DomainError("region_mismatch", "测量记录不属于当前管辖区域", 403)
+                if item["payload"].get("region") != region:
+                    raise DomainError("region_mismatch", "不能回传其他区域事件的测量", 403)
+            entries.append({
+                "normalized": normalized,
+                "raw": raw,
+                "vehicle_id": actor,
+                "batch_id": batch_id,
+                "dedup_key": self._offline_dedup_key(actor, batch_id, normalized),
+            })
+        results = self.repository.ingest_offline_batch(
+            actor, batch_id, entries, actor, role, rules.merge_offline_measurement
+        )
+        stored = sum(1 for r in results if r["status"] == "stored")
+        return {
+            "batch_id": batch_id,
+            "vehicle_id": actor,
+            "stored": stored,
+            "duplicates": len(results) - stored,
+            "results": results,
+        }
 
     def list_items(self, status=None):
         return self.repository.list_items(status)
