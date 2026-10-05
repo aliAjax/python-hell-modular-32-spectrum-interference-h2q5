@@ -89,3 +89,55 @@ def normalize_source(payload):
         "station_id": payload.get("station_id"),
         "frequency_mhz": payload.get("frequency_mhz"),
     }
+
+
+def normalize_offline_measurement(payload):
+    """归一化单条离线测量。"""
+    station_id = require_text(payload, "station_id")
+    region = require_text(payload, "region")
+    frequency = number(payload, "frequency_mhz", 0.001, 300000)
+    bandwidth = number(payload, "bandwidth_mhz", 0.001)
+    strength = number(payload, "strength_dbm")
+    detected_at = parse_timestamp(payload, "detected_at")
+    vehicle_id = payload.get("vehicle_id")
+    if vehicle_id is not None:
+        vehicle_id = str(vehicle_id).strip() or None
+    offline_assessment = payload.get("offline_assessment")
+    if offline_assessment is not None and not isinstance(offline_assessment, dict):
+        raise DomainError("invalid_payload", "offline_assessment 必须是对象")
+    stable_key = "%s|%s|%s|%s" % (station_id, region, frequency, detected_at)
+    match_key = "%s|%s|%s|" % (station_id, region, frequency)
+    return {
+        "station_id": station_id,
+        "region": region,
+        "frequency_mhz": frequency,
+        "bandwidth_mhz": bandwidth,
+        "strength_dbm": strength,
+        "detected_at": detected_at,
+        "vehicle_id": vehicle_id,
+        "offline_assessment": offline_assessment,
+        "stable_key": stable_key,
+        "match_key": match_key,
+        "payload": payload,
+    }
+
+
+def normalize_offline_batch(payload):
+    """归一化离线批次回传。批次号可选（旧数据无批次号兼容并入）。"""
+    if not isinstance(payload, dict):
+        raise DomainError("invalid_payload", "请求体必须是对象")
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, list) or not measurements:
+        raise DomainError("invalid_payload", "measurements 必须是非空数组")
+    batch_uuid = payload.get("batch_id")
+    if batch_uuid is not None:
+        batch_uuid = str(batch_uuid).strip() or None
+    vehicle_id = payload.get("vehicle_id")
+    if vehicle_id is not None:
+        vehicle_id = str(vehicle_id).strip() or None
+    normalized = [normalize_offline_measurement(m) for m in measurements]
+    return {
+        "batch_id": batch_uuid,
+        "vehicle_id": vehicle_id,
+        "measurements": normalized,
+    }

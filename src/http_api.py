@@ -52,6 +52,10 @@ def build_handler(service, static_dir):
                     return self._send(200, service.state())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
+                if path == "/api/offline/batches":
+                    return self._send(200, {"batches": service.list_offline_batches()})
+                if path == "/api/offline/measurements":
+                    return self._send(200, {"measurements": service.list_offline_measurements()})
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
@@ -86,6 +90,8 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if parts == ["api", "offline", "batches"]:
+                    return self._send(201, service.offline_batch_upload(payload, actor, role, region))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

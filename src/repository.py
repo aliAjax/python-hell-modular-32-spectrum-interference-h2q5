@@ -70,6 +70,43 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS offline_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_uuid TEXT,
+                    vehicle_id TEXT,
+                    region TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS offline_measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL,
+                    item_id INTEGER,
+                    stable_key TEXT NOT NULL,
+                    match_key TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    station_id TEXT NOT NULL,
+                    frequency_mhz REAL NOT NULL,
+                    bandwidth_mhz REAL NOT NULL,
+                    strength_dbm REAL NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    offline_assessment TEXT,
+                    content_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    conflict_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(batch_id) REFERENCES offline_batches(id),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_offline_batches_uuid
+                    ON offline_batches(batch_uuid);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_offline_measurements_hash
+                    ON offline_measurements(content_hash);
+                CREATE INDEX IF NOT EXISTS idx_offline_measurements_match
+                    ON offline_measurements(match_key);
                 """
             )
         finally:
@@ -257,5 +294,181 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # 离线回收 (offline recovery)
+    # ------------------------------------------------------------------
+
+    def batch_exists(self, batch_uuid):
+        """判断批次号是否已入库（无批次号时返回 False）。"""
+        if not batch_uuid:
+            return False
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM offline_batches WHERE batch_uuid=?", (batch_uuid,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def create_offline_batch(self, batch_uuid, vehicle_id, region, payload, actor, role):
+        """创建离线批次。批次号重复时抛 ConflictError。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO offline_batches(batch_uuid,vehicle_id,region,actor,role,payload,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (batch_uuid, vehicle_id, region, actor, role, canonical_json(payload), now_iso()),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError("duplicate_batch", "同一批次已经上传，请勿重复提交")
+            batch_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            conn.execute("COMMIT")
+            return batch_id
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def measurement_hash_exists(self, content_hash):
+        """判断测量内容哈希是否已入库（去重）。"""
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM offline_measurements WHERE content_hash=?", (content_hash,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def store_offline_measurement(self, batch_id, measurement, content_hash, disposition, conflict_reason):
+        """存储一条离线测量。内容哈希已存在时返回 None（去重，不重复入库）。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.measurement_hash_exists(content_hash):
+                conn.execute("ROLLBACK")
+                return None
+            item_id = measurement.get("item_id")
+            offline_assessment = measurement.get("offline_assessment")
+            conn.execute(
+                "INSERT INTO offline_measurements(batch_id,item_id,stable_key,match_key,region,station_id,frequency_mhz,bandwidth_mhz,strength_dbm,detected_at,offline_assessment,content_hash,payload,disposition,conflict_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    batch_id,
+                    item_id,
+                    measurement["stable_key"],
+                    measurement["match_key"],
+                    measurement["region"],
+                    measurement["station_id"],
+                    measurement["frequency_mhz"],
+                    measurement["bandwidth_mhz"],
+                    measurement["strength_dbm"],
+                    measurement["detected_at"],
+                    canonical_json(offline_assessment) if offline_assessment is not None else None,
+                    content_hash,
+                    canonical_json(measurement["payload"]),
+                    disposition,
+                    conflict_reason,
+                    now_iso(),
+                ),
+            )
+            measurement_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            conn.execute("COMMIT")
+            return measurement_id
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def find_latest_item_by_match_key(self, match_key):
+        """按 match_key（station_id|region|frequency）查找最近的业务实体。"""
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM items WHERE stable_key LIKE ? ORDER BY id DESC LIMIT 1",
+                (match_key + "%",),
+            ).fetchone()
+            return self._row_to_item(row)
+        finally:
+            conn.close()
+
+    def list_offline_batches(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT * FROM offline_batches ORDER BY id DESC").fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                result.append(value)
+            return result
+        finally:
+            conn.close()
+
+    def list_offline_measurements(self, batch_id=None, disposition=None):
+        conn = self.connect()
+        try:
+            sql = "SELECT * FROM offline_measurements WHERE 1=1"
+            params = []
+            if batch_id is not None:
+                sql += " AND batch_id=?"
+                params.append(batch_id)
+            if disposition is not None:
+                sql += " AND disposition=?"
+                params.append(disposition)
+            sql += " ORDER BY id DESC"
+            rows = conn.execute(sql, params).fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                if value.get("offline_assessment"):
+                    value["offline_assessment"] = json.loads(value["offline_assessment"])
+                result.append(value)
+            return result
+        finally:
+            conn.close()
+
+    def update_item_measurement(self, item_id, new_payload, actor, role):
+        """合并离线测量到业务实体：更新 payload、自增版本、记录审计，状态不变。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET payload=?,version=?,updated_at=? WHERE id=?",
+                (canonical_json(new_payload), version, now_iso(), item_id),
+            )
+            self.append_audit(
+                conn,
+                item_id,
+                "measurement_merged",
+                actor,
+                role,
+                {"strength_dbm": new_payload.get("strength_dbm"), "detected_at": new_payload.get("detected_at")},
+            )
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()

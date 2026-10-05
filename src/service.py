@@ -1,4 +1,4 @@
-from . import domain, rules
+from . import domain, offline, rules
 from .domain import DomainError
 
 
@@ -67,3 +67,13 @@ class Service:
 
     def state(self):
         return self.repository.state_summary()
+
+    def offline_batch_upload(self, payload, actor, role, region=None):
+        """离线测量批量回传。"""
+        return offline.process_batch(self.repository, payload, actor, role, region)
+
+    def list_offline_batches(self):
+        return self.repository.list_offline_batches()
+
+    def list_offline_measurements(self, batch_id=None, disposition=None):
+        return self.repository.list_offline_measurements(batch_id, disposition)

@@ -14,10 +14,20 @@ ACTION_ROLES = {
     "resolve": {"coordinator", "regulator"},
     "correct_measurement": {"analyst", "monitor"},
     "cancel": {"coordinator"},
+    "clear_conflict": {"analyst", "monitor", "coordinator"},
 }
 ENFORCE_REGION = True
 REGION_SENSITIVE_ACTIONS = {"suspend", "coordinate", "resolve", "cancel"}
 ACTION_REQUIRES_VERSION = {"suspend", "coordinate", "resolve", "cancel"}
+
+# 离线回收相关
+OFFLINE_ROLES = {"monitor", "analyst"}
+TERMINAL_STATUSES = {"resolved", "cancelled"}
+
+
+def has_pending_conflict(item):
+    """业务实体是否挂有待核对冲突。"""
+    return bool(item.get("payload", {}).get("pending_conflict"))
 
 
 def assess(payload):
@@ -75,6 +85,8 @@ def apply_action(item, action, payload, actor, role):
         return status, current, {"revision": revision}
 
     if action == "locate":
+        if has_pending_conflict(item):
+            raise DomainError("pending_conflict", "存在待核对冲突，不能定位，请先核对", 409)
         _need_status(item, {"assessed", "located"})
         location = _text(payload, "location")
         confidence = float(payload.get("confidence", 0))
@@ -84,6 +96,8 @@ def apply_action(item, action, payload, actor, role):
         return "located", current, {"location": current["location"]}
 
     if action == "suspend":
+        if has_pending_conflict(item):
+            raise DomainError("pending_conflict", "存在待核对冲突，不能停用，请先核对", 409)
         _need_status(item, {"located", "suspended"})
         authorization = _text(payload, "authorization_code")
         if not authorization.startswith("REG-"):
@@ -110,5 +124,11 @@ def apply_action(item, action, payload, actor, role):
         reason = _text(payload, "reason")
         current["cancellation"] = {"reason": reason, "actor": actor}
         return "cancelled", current, {"reason": reason}
+
+    if action == "clear_conflict":
+        if not has_pending_conflict(item):
+            raise DomainError("no_pending_conflict", "当前没有待核对冲突")
+        current.pop("pending_conflict", None)
+        return status, current, {"cleared": True}
 
     raise DomainError("unknown_action", "不支持的操作")
